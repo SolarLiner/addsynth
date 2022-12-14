@@ -1,7 +1,10 @@
 use nih_plug::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::{
+    simd::f32x8,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
+};
 
-use crate::{phasor::Phasor, oscillator::Oscillator};
+use crate::{oscillator::Oscillator, phasor::Phasor8};
 
 static NEXT_VOICE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -30,8 +33,11 @@ impl VoiceId {
         }
     }
 
-    pub fn note_phasor(&self, samplerate: f32) -> Phasor {
-        Phasor::new(samplerate, util::midi_note_to_freq(self.note))
+    pub fn note_phasor(&self, samplerate: f32) -> Phasor8 {
+        Phasor8::new(
+            f32x8::splat(samplerate),
+            f32x8::splat(util::midi_note_to_freq(self.note)),
+        )
     }
 
     pub fn next_id() -> u64 {
@@ -51,12 +57,10 @@ pub struct Voice {
 
 impl Voice {
     pub fn new(osc: Oscillator, id: VoiceId, velocity: f32, a: f32) -> Self {
-        let samplerate = osc.samplerate();
+        let samplerate = osc.samplerate;
         let amp_envelope = Smoother::new(SmoothingStyle::Logarithmic(a));
         amp_envelope.reset(1e-4);
         amp_envelope.set_target(samplerate, 1.0);
-
-        let phase = id.note_phasor(samplerate);
 
         Self {
             id,
@@ -69,9 +73,11 @@ impl Voice {
     }
 
     pub fn release(&mut self, r: f32) {
+        let end_vol = self.amp_envelope.previous_value();
         self.amp_envelope = Smoother::new(SmoothingStyle::Exponential(r));
-        self.amp_envelope.reset(1.0);
-        self.amp_envelope.set_target(self.oscillator.samplerate(), 0.0);
+        self.amp_envelope.reset(end_vol);
+        self.amp_envelope
+            .set_target(self.oscillator.samplerate, 0.0);
         self.releasing = true;
     }
 
@@ -118,7 +124,10 @@ impl Voice {
 
     pub fn update_gain(&mut self, normalized_value_gen: impl FnOnce(f32) -> f32) {
         if let Some((normalized_offset, smoother)) = self.voice_gain.as_mut() {
-            smoother.set_target(self.oscillator.samplerate(), normalized_value_gen(*normalized_offset));
+            smoother.set_target(
+                self.oscillator.samplerate,
+                normalized_value_gen(*normalized_offset),
+            );
         }
     }
 

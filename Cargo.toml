@@ -15,7 +15,9 @@ crate-type = ["cdylib"]
 [dependencies]
 # Remove the `assert_process_allocs` feature to allow allocations on the audio
 # thread in debug builds.
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = [
+    "assert_process_allocs",
+] }
 num-complex = "0.4.2"
 rand = "0.8.5"
 rand_pcg = "0.3.1"
@@ -23,5 +25,28 @@ rand_pcg = "0.3.1"
 # the GPL compatibility requirement
 # nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default_features = false, features = ["assert_process_allocs"] }
 
+[dev-dependencies]
+criterion = "0.4.0"
+
+[[bench]]
+name = "sine_lut"
+harness = false
+
 [profile.dev]
 opt-level = 1
+lto = false
+debug = true
+strip = "none"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.profiling]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = false

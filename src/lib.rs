@@ -1,3 +1,6 @@
+#![feature(link_llvm_intrinsics)]
+#![feature(portable_simd)]
+#![feature(simd_ffi)]
 use crate::voice::{Voice, VoiceId};
 use nih_plug::prelude::*;
 use oscillator::Oscillator;
@@ -5,9 +8,11 @@ use rand::Rng;
 use rand_pcg::Pcg32;
 use std::sync::Arc;
 
+mod externs;
+mod oscillator;
 mod phasor;
 mod voice;
-mod oscillator;
+mod adsr;
 
 /// The number of simultaneous voices for this synth.
 const NUM_VOICES: u32 = 16;
@@ -41,12 +46,20 @@ impl Addsynth {
         velocity: f32,
     ) -> &mut Voice {
         let samplerate = ctx.transport().sample_rate;
-        let voice = Voice::new(
-            Oscillator::triangle(samplerate, util::midi_note_to_freq(id.note)),
+        let hz = util::midi_note_to_freq(id.note);
+        let mut voice = Voice::new(
+            match self.params.osc_type.plain_value() {
+                OscillatorType::Sine => Oscillator::sine(samplerate, hz),
+                OscillatorType::Triangle => Oscillator::triangle(samplerate, hz),
+                OscillatorType::Square => Oscillator::square(samplerate, hz),
+                OscillatorType::Saw => Oscillator::saw(samplerate, hz),
+            },
             id,
             velocity,
             self.params.amp_attack_ms.value(),
         );
+        voice.oscillator.phase_offset = self.prng.gen();
+
         match self.voices.iter().position(|v| v.is_none()) {
             Some(free_voice_id) => {
                 self.voices[free_voice_id] = Some(voice);
@@ -75,8 +88,18 @@ impl Addsynth {
     }
 }
 
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+enum OscillatorType {
+    Sine,
+    Triangle,
+    Saw,
+    Square,
+}
+
 #[derive(Params)]
 struct AddsynthParams {
+    #[id = "type"]
+    osc_type: EnumParam<OscillatorType>,
     /// A voice's gain. This can be polyphonically modulated.
     #[id = "gain"]
     gain: FloatParam,
@@ -103,13 +126,14 @@ impl Default for Addsynth {
 impl Default for AddsynthParams {
     fn default() -> Self {
         Self {
+            osc_type: EnumParam::new("Type", OscillatorType::Sine),
             gain: FloatParam::new(
                 "Gain",
                 util::db_to_gain(-12.0),
                 // Because we're representing gain as decibels the range is already logarithmic
                 FloatRange::Linear {
                     min: util::db_to_gain(-36.0),
-                    max: util::db_to_gain(0.0),
+                    max: util::db_to_gain(12.0),
                 },
             )
             // This enables polyphonic mdoulation for this parameter by representing all related
@@ -218,14 +242,12 @@ impl Plugin for Addsynth {
                                 note,
                                 velocity,
                             } => {
-                                let initial_phase = self.prng.gen();
-                                let voice = self.create_voice(
+                                self.create_voice(
                                     context,
                                     timing,
                                     VoiceId::new(voice_id, channel, note),
                                     velocity,
                                 );
-                                voice.oscillator.set_phase(initial_phase);
                             }
                             NoteEvent::NoteOff {
                                 timing: _,
@@ -348,8 +370,6 @@ impl Plugin for Addsynth {
             let mut gain = [0.0; MAX_BLOCK_SIZE];
             self.params.gain.smoothed.next_block(&mut gain, block_len);
 
-            // TODO: Amp envelope
-            // TODO: Some form of band limiting
             // TODO: Filter
             for voice in self.voices.iter_mut().filter_map(|v| v.as_mut()) {
                 for (value_idx, sample_idx) in (block_start..block_end).enumerate() {
