@@ -1,12 +1,20 @@
-use nih_plug::prelude::*;
-use std::{
-    simd::f32x8,
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
+use std::sync::{
+    atomic::{AtomicPtr, AtomicU64, Ordering::Relaxed},
+    Arc,
 };
 
-use crate::{oscillator::Oscillator, phasor::Phasor8};
+use nih_plug::prelude::*;
+
+use crate::lpf::{Ladder, LP1};
+use crate::{
+    adsr::{Adsr, AdsrParams},
+    oscillator::Oscillator,
+    tanh::TanhLut,
+};
 
 static NEXT_VOICE_ID: AtomicU64 = AtomicU64::new(0);
+
+pub static TANH_LUT_PTR: AtomicPtr<TanhLut<true>> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Compute a voice ID in case the host doesn't provide them. Polyphonic modulation will not work in
 /// this case, but playing notes will.
@@ -14,7 +22,7 @@ const fn compute_fallback_voice_id(note: u8, channel: u8) -> i32 {
     note as i32 | ((channel as i32) << 16)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct VoiceId {
     pub id: u64,
     pub voice_id: i32,
@@ -33,15 +41,91 @@ impl VoiceId {
         }
     }
 
-    pub fn note_phasor(&self, samplerate: f32) -> Phasor8 {
-        Phasor8::new(
-            f32x8::splat(samplerate),
-            f32x8::splat(util::midi_note_to_freq(self.note)),
-        )
+    pub fn is_id(&self, id: i32) -> bool {
+        self.voice_id == id
+    }
+
+    pub fn is_channel_note(&self, channel: u8, note: u8) -> bool {
+        self.channel == channel && self.note == note
     }
 
     pub fn next_id() -> u64 {
         NEXT_VOICE_ID.load(Relaxed)
+    }
+}
+
+impl PartialEq for VoiceId {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for VoiceId {}
+
+#[derive(Debug, Params)]
+pub struct VoiceParams {
+    #[nested(id_prefix = "amp", group = "Amp")]
+    amp: Arc<AdsrParams>,
+
+    #[nested(id_prefix = "filter", group = "Filter")]
+    filter: Arc<AdsrParams>,
+
+    #[id = "fhz"]
+    fhz: FloatParam,
+
+    #[id = "q"]
+    q: FloatParam,
+
+    #[id = "fmod"]
+    fmod: FloatParam,
+
+    #[id = "drive"]
+    drive: FloatParam,
+}
+
+impl Default for VoiceParams {
+    fn default() -> Self {
+        Self {
+            amp: Arc::new(AdsrParams::default()),
+            filter: Arc::new(AdsrParams::default()),
+            fhz: FloatParam::new(
+                "Filter Cutoff",
+                300.,
+                FloatRange::Skewed {
+                    min: 20.,
+                    max: 20e3,
+                    factor: FloatRange::skew_factor(-2.),
+                },
+            )
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz())
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(2))
+            .with_smoother(SmoothingStyle::Exponential(100.)),
+            q: FloatParam::new("Filter Q", 0., FloatRange::Linear { min: 0., max: 1. })
+                .with_smoother(SmoothingStyle::Linear(30.)),
+            fmod: FloatParam::new(
+                "Filter Modulation",
+                3000.,
+                FloatRange::Skewed {
+                    min: 0.,
+                    max: 20e3,
+                    factor: FloatRange::skew_factor(-2.),
+                },
+            )
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz())
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(2))
+            .with_smoother(SmoothingStyle::Exponential(100.)),
+            drive: FloatParam::new(
+                "Filter drive",
+                0.,
+                FloatRange::SymmetricalSkewed {
+                    min: -36.,
+                    max: 36.,
+                    center: 0.,
+                    factor: 2.,
+                },
+            )
+            .with_unit("dB")
+            .with_smoother(SmoothingStyle::Exponential(50.)),
+        }
     }
 }
 
@@ -50,50 +134,59 @@ pub struct Voice {
     id: VoiceId,
     pub oscillator: Oscillator,
     velsqrt: f32,
-    releasing: bool,
-    amp_envelope: Smoother<f32>,
+    params: Arc<VoiceParams>,
+    amp: Adsr,
+    filter: Adsr,
     voice_gain: Option<(f32, Smoother<f32>)>,
+    lpf: Ladder,
+    // lpf: LP1,
 }
 
-impl Voice {
-    pub fn new(osc: Oscillator, id: VoiceId, velocity: f32, a: f32) -> Self {
-        let samplerate = osc.samplerate;
-        let amp_envelope = Smoother::new(SmoothingStyle::Logarithmic(a));
-        amp_envelope.reset(1e-4);
-        amp_envelope.set_target(samplerate, 1.0);
+impl PartialEq for Voice {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
 
+impl Eq for Voice {}
+
+impl Voice {
+    pub fn new(osc: Oscillator, id: VoiceId, velocity: f32, params: Arc<VoiceParams>) -> Self {
+        let samplerate = osc.samplerate;
         Self {
             id,
             oscillator: osc,
             velsqrt: velocity.sqrt(),
-            releasing: false,
-            amp_envelope,
+            params: params.clone(),
+            amp: Adsr::new(samplerate, params.amp.clone()),
+            filter: Adsr::new(samplerate, params.filter.clone()),
             voice_gain: None,
+            lpf: Ladder::new(samplerate, params.fhz.value(), params.q.value()),
+            // lpf: LP1::new(samplerate, params.fhz.value()),
         }
     }
 
-    pub fn release(&mut self, r: f32) {
-        let end_vol = self.amp_envelope.previous_value();
-        self.amp_envelope = Smoother::new(SmoothingStyle::Exponential(r));
-        self.amp_envelope.reset(end_vol);
-        self.amp_envelope
-            .set_target(self.oscillator.samplerate, 0.0);
-        self.releasing = true;
+    pub fn release(&mut self) {
+        self.amp.release();
     }
 
     pub fn done(&self) -> bool {
-        self.releasing && self.amp_envelope.previous_value() == 0.0
+        !self.amp.active()
     }
 
     pub fn matches(&self, voice_id: Option<i32>, channel: u8, note: u8) -> bool {
-        let candidate = voice_id.unwrap_or_else(|| compute_fallback_voice_id(channel, note));
-        self.id.voice_id == candidate
+        if let Some(id) = voice_id {
+            self.id.is_id(id)
+        } else {
+            self.id.is_channel_note(channel, note)
+        }
     }
 
     pub fn voice_id(&self) -> i32 {
         self.id.voice_id
     }
 
+    #[cfg(never)]
     pub fn create_gain_smoother(
         &mut self,
         normalized_offset: f32,
@@ -105,13 +198,21 @@ impl Voice {
         smoother
     }
 
-    pub fn next_sample(&mut self, global_gain: f32) -> f32 {
+    pub fn next_sample(&mut self) -> f32 {
         let gain = match self.voice_gain.as_ref() {
             Some((_, smoother)) => smoother.next(),
             None => 1.0,
         };
-        let amp = self.amp_envelope.next() * gain * global_gain * self.velsqrt;
-        (self.oscillator.sample() * amp).tanh()
+        let amp = self.amp.next() * gain * self.velsqrt;
+        let osc =
+            self.oscillator.sample() * amp * util::db_to_gain(self.params.drive.smoothed.next());
+
+        self.lpf.set_fc(
+            self.params.fhz.smoothed.next() + self.filter.next() * self.params.fmod.smoothed.next(),
+        );
+        self.lpf.set_resonance(self.params.q.smoothed.next());
+        // self.lpf.fc = self.params.fhz.smoothed.next() + self.filter.next() * self.params.fmod.smoothed.next();
+        self.lpf.process_sample(osc)
     }
 
     pub fn channel(&self) -> u8 {
@@ -122,6 +223,7 @@ impl Voice {
         self.id.note
     }
 
+    #[cfg(never)]
     pub fn update_gain(&mut self, normalized_value_gen: impl FnOnce(f32) -> f32) {
         if let Some((normalized_offset, smoother)) = self.voice_gain.as_mut() {
             smoother.set_target(

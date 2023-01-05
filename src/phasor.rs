@@ -16,14 +16,17 @@ impl Phasor8 {
         }
     }
 
+    #[inline(always)]
     pub fn step(&self) -> f32x8 {
         self.hz / self.samplerate
     }
 
+    #[inline(always)]
     pub fn inc(&mut self, amt: u8x8) -> f32x8 {
         self.set_phase(self.phase + amt.cast::<f32>() * self.step())
     }
 
+    #[inline(always)]
     pub fn set_phase(&mut self, phase: f32x8) -> f32x8 {
         let neg_mask = phase.simd_le(f32x8::default());
         self.phase = neg_mask.select(phase + f32x8::splat(1.), phase) % f32x8::splat(1.);

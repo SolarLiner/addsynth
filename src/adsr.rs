@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+
 use std::fmt;
 use std::fmt::Formatter;
 use nih_plug::prelude::*;
@@ -10,13 +10,14 @@ enum AdsrState {
     D,
     S,
     R,
+    Released,
 }
 
 #[derive(Debug, Clone)]
 pub struct Adsr {
     params: Arc<AdsrParams>,
     smoother: Smoother<f32>,
-    state: Cell<AdsrState>,
+    state: AdsrState,
     samplerate: f32,
 }
 
@@ -29,7 +30,7 @@ impl Adsr {
             params,
             smoother,
             samplerate,
-            state: Cell::new( AdsrState::A),
+            state: AdsrState::A,
         }
     }
 
@@ -37,16 +38,73 @@ impl Adsr {
         self.smoother.previous_value()
     }
 
-    pub fn next(&self) -> f32 {
-        todo!()
+    pub fn next(&mut self) -> f32 {
+        if self.smoother.steps_left() == 0 {
+            match self.state {
+                AdsrState::A => {
+                    self.smoother = Smoother::new(SmoothingStyle::Exponential(self.params.d.value()));
+                    self.smoother.reset(1.0);
+                    self.smoother.set_target(self.samplerate, self.params.s.value());
+                    self.state = AdsrState::D;
+                }
+                AdsrState::D => {
+                    self.state = AdsrState::S;
+                }
+                AdsrState::R => {
+                    self.state = AdsrState::Released;
+                }
+                _ => {}
+            }
+        } else {
+            match self.state {
+                AdsrState::A => {
+                    self.smoother.style = SmoothingStyle::Exponential(self.params.a.value());
+                }
+                AdsrState::D => {
+                    self.smoother.style = SmoothingStyle::Exponential(self.params.d.value());
+                    self.smoother.set_target(self.samplerate, self.params.s.value());
+                }
+                AdsrState::R => {
+                    self.smoother.style = SmoothingStyle::Exponential(self.params.r.value());
+                }
+                _ => {}
+            }
+        }
+
+        self.smoother.next()
+    }
+
+    pub fn release(&mut self) {
+        let val = self.smoother.previous_value();
+        self.state = AdsrState::R;
+        self.smoother = Smoother::new(SmoothingStyle::Exponential(self.params.r.value()));
+        self.smoother.reset(val);
+        self.smoother.set_target(self.samplerate, 0.);
+    }
+
+    pub fn releasing(&self) -> bool {
+        matches!(self.state, AdsrState::R)
+    }
+
+    #[inline(always)]
+    pub fn active(&self) -> bool {
+        match self.state {
+            AdsrState::Released => false,
+            AdsrState::S if self.params.s.value() == 0. => false,
+            _ => true,
+        }
     }
 }
 
+#[derive(Params)]
 pub struct AdsrParams {
-    prefix: &'static str,
+    #[id="a"]
     a: FloatParam,
+    #[id="d"]
     d: FloatParam,
+    #[id="s"]
     s: FloatParam,
+    #[id="r"]
     r: FloatParam,
 }
 
@@ -56,26 +114,14 @@ impl fmt::Debug for AdsrParams {
     }
 }
 
-impl AdsrParams {
-    pub fn new(prefix: &'static str) -> Self {
+impl Default for AdsrParams {
+    fn default() -> Self {
         Self {
-            prefix,
             a: adr_param(format!("Attack"), 10.),
             d: adr_param(format!("Decay"), 300.),
             s: s_param(format!("Sustain"), 0.5),
             r: adr_param(format!("Release"), 300.),
         }
-    }
-}
-
-unsafe impl Params for AdsrParams {
-    fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
-        vec![
-            (format!("{}_a", self.prefix), self.a.as_ptr(), "".to_string()),
-            (format!("{}_d", self.prefix), self.d.as_ptr(), "".to_string()),
-            (format!("{}_s", self.prefix), self.s.as_ptr(), "".to_string()),
-            (format!("{}_r", self.prefix), self.r.as_ptr(), "".to_string()),
-        ]
     }
 }
 
