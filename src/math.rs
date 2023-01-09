@@ -14,9 +14,6 @@ where
     S: ScalarField<T, N>,
 {
     let j = s.jacobian(x);
-    if j.is_zero() {
-        return Some(SVector::zeros());
-    }
     let Some(ij) = j.clone_owned().try_inverse() else {
         eprintln!("Jacobian matrix non-invertible:\n{j}");
         return None;

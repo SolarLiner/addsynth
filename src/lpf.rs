@@ -77,7 +77,7 @@ pub struct Ladder {
     samplerate: f32,
     u: Y,
     g: f32,
-    s: Y,
+    y: Y,
     k: f32,
     fb: f32,
 }
@@ -88,14 +88,14 @@ impl Ladder {
             samplerate,
             u: Y::zeros(),
             g: PI * fc / samplerate,
-            s: Y::zeros(),
+            y: Y::zeros(),
             k: q,
             fb: 0.,
         }
     }
 
     pub fn set_fc(&mut self, fc: f32) {
-        self.g = PI * fc.min(self.samplerate/2.) / self.samplerate;
+        self.g = PI * fc.min(self.samplerate) / self.samplerate /2.;
     }
 
     pub fn set_resonance(&mut self, q: f32) {
@@ -107,26 +107,21 @@ impl Ladder {
         let phi = Phi {
             g: self.g,
             k: self.k,
-            s: self.s,
+            s: self.y,
             x,
         };
-        // self.u = phi.eval_u();
         for i in 0..4 {
-            let Some(step) = nr_step(&phi, &self.u) else {
+            let Some(step) = nr_step(&phi, &self.y) else {
                 break;
             };
-            self.u -= step;
-            if step.magnitude_squared() < 1e-3 {
-                nih_log!("Converged after {i} iterations (mag. {} < 1e-3)", step.magnitude_squared());
+            self.y -= step;
+            if step.magnitude_squared() < 1e-4 {
+                // nih_log!("Converged after {i} iterations (mag. {} < 1e-4)", step.magnitude_squared());
                 break;
             }
         }
-        // for s in self.u.iter_mut() {
-        //     *s = s.clamp(-1., 1.);
-        // }
-        let y = self.g * self.u + self.s;
-        self.s = self.u;
-        y[3]
+        self.u = phi.eval_u(&self.y);
+        self.y[3]
     }
 }
 
@@ -140,42 +135,54 @@ struct Phi {
 const DIODE_PARAM: f32 = 0.2577819;
 #[inline]
 fn sat(x: f32) -> f32 {
-    x.tanh()
-    // x/(DIODE_PARAM+x.abs())
+    // x.tanh()
+    x/(DIODE_PARAM+x.abs())
 }
 
 #[inline]
 fn satd(x: f32) -> f32 {
-    1. - x.tanh().powi(2)
-    // DIODE_PARAM / (DIODE_PARAM + x.abs().powi(2))
+    // 1. - x.tanh().powi(2)
+    DIODE_PARAM / (DIODE_PARAM + x.abs().powi(2))
 }
 
 impl Phi {
     #[inline(always)]
-    fn v(&self, s: &Y) -> Y {
+    fn v(&self, y: &Y) -> Y {
         Y::new(
-            self.x - self.k * s[3] - s[0],
-            s[0] - s[1],
-            s[1] - s[2],
-            s[2] - s[3],
+            self.x - self.k * y[3] - y[0],
+            y[0] - y[1],
+            y[1] - y[2],
+            y[2] - y[3],
         )
     }
 
     #[inline(always)]
-    fn eval_u(&self) -> Y {
-        self.v(&self.s).map(sat) * self.g + self.s
+    fn eval_u(&self, y: &Y) -> Y {
+        self.v(y).map(sat) * self.g
     }
 }
 
 impl ScalarField<f32, 4> for Phi {
     #[inline(always)]
-    fn eval(&self, u: &SVector<f32, 4>) -> SVector<f32, 4> {
-        self.eval_u() - u
+    fn eval(&self, y: &SVector<f32, 4>) -> SVector<f32, 4> {
+        self.eval_u(y) + self.s - y
     }
 
     #[inline(always)]
-    fn jacobian(&self, _: &SVector<f32, 4>) -> SMatrix<f32, 4, 4> {
-        -SMatrix::identity()
+    #[rustfmt::skip]
+    fn jacobian(&self, y: &SVector<f32, 4>) -> SMatrix<f32, 4, 4> {
+        let v = self.v(y);
+        let v = v.map(satd);
+        SMatrix::<_, 4, 4>::new(
+            // Row 1
+            -v[0], 0., 0., -self.k * v[0],
+            // Row 2
+            v[1], -v[1], 0., 0.,
+            // Row 3
+            0., v[2], -v[2], 0.,
+            // Row 4
+            0., 0., v[3], -v[3],
+        ) * self.g - SMatrix::identity()
     }
 }
 
@@ -189,10 +196,10 @@ mod tests {
     fn phi_nr() {
         const FS: f32 = 44.1e3;
         const FREQ: f32 = 500.;
-        const FC: f32 = 19.8e3;
+        const FC: f32 = 6e3;
         const PERIOD: f32 = 1. / FREQ;
         let mut output = File::create("lpf.tsv").unwrap();
-        let mut filter = Ladder::new(FS, FC, 1.);
+        let mut filter = Ladder::new(FS, FC, 8.);
         writeln!(output, "\"x\"\t\"y\"\t\"s\"").unwrap();
         for i in 0..512 {
             let t = i as f32 / FS;
@@ -201,7 +208,7 @@ mod tests {
             let x = 2. * f - 1.;
             // let x = if f < 0.5 { 1. } else { -1. };
             let y = filter.process_sample(x);
-            writeln!(output, "{}\t{y}\t\"{:?}\"", x, filter.s).unwrap();
+            writeln!(output, "{}\t{y}\t\"{:?}\"", x, filter.y).unwrap();
         }
     }
 }

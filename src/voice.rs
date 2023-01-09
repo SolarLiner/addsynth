@@ -104,7 +104,7 @@ impl Default for VoiceParams {
                 0.,
                 FloatRange::Skewed {
                     min: 0.,
-                    max: 3.,
+                    max: 16.,
                     factor: FloatRange::skew_factor(-2.),
                 },
             )
