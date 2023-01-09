@@ -1,8 +1,10 @@
 use std::f32::consts::PI;
-use std::ops::Sub;
 
-use nalgebra::SVector;
+use nalgebra::{SMatrix, SVector};
+use nih_plug::nih_log;
 use num_complex::ComplexFloat;
+
+use crate::math::{nr_step, ScalarField};
 
 #[derive(Debug, Copy, Clone)]
 pub struct LP1 {
@@ -24,12 +26,22 @@ impl LP1 {
         self.fc * PI / self.samplerate
     }
 
-    pub fn process_sample(&mut self, x: f32) -> f32 {
+    #[inline(always)]
+    pub fn process_lp(&mut self, x: f32) -> f32 {
         let in0 = self.fb_gain() * x;
-        let y = self.fb + in0;
+        let y = in0 + self.fb;
         let y = y.tanh();
-        self.fb = y + in0;
+        self.fb = y - in0;
         y
+    }
+
+    #[inline(always)]
+    pub fn process_hp(&mut self, x: f32) -> f32 {
+        let in0 = self.fb_gain() * x;
+        let yhp = self.fb + in0;
+        let y = yhp.tanh();
+        self.fb = y - in0;
+        yhp
     }
 }
 
@@ -54,18 +66,16 @@ impl<const N: usize> LP<N> {
     }
 
     pub fn process_sample(&mut self, x: f32) -> f32 {
-        self.0.iter_mut().fold(x, |s, f| f.process_sample(s))
+        self.0.iter_mut().fold(x, |s, f| f.process_lp(s))
     }
 }
 
-type F<T> = fn(T) -> T;
 type Y = SVector<f32, 4>;
-type L = F<Y>;
 
 #[derive(Debug, Copy, Clone)]
 pub struct Ladder {
-    w_step: f32,
-    y: Y,
+    samplerate: f32,
+    u: Y,
     g: f32,
     s: Y,
     k: f32,
@@ -75,8 +85,8 @@ pub struct Ladder {
 impl Ladder {
     pub fn new(samplerate: f32, fc: f32, q: f32) -> Self {
         Self {
-            w_step: PI / samplerate,
-            y: Y::zeros(),
+            samplerate,
+            u: Y::zeros(),
             g: PI * fc / samplerate,
             s: Y::zeros(),
             k: q,
@@ -85,46 +95,113 @@ impl Ladder {
     }
 
     pub fn set_fc(&mut self, fc: f32) {
-        self.g = self.w_step * fc;
+        self.g = PI * fc.min(self.samplerate/2.) / self.samplerate;
     }
 
     pub fn set_resonance(&mut self, q: f32) {
         self.k = q;
     }
 
+    #[inline(always)]
     pub fn process_sample(&mut self, x: f32) -> f32 {
-        for _ in 0..4 {
-            self.y -= (self.phi(x, self.y) - self.y).component_mul(
-                &self
-                    .phid(self.y)
-                    .map(|x| x.recip())
-                    .sub(&Y::from_element(1.)),
-            )
+        let phi = Phi {
+            g: self.g,
+            k: self.k,
+            s: self.s,
+            x,
+        };
+        // self.u = phi.eval_u();
+        for i in 0..4 {
+            let Some(step) = nr_step(&phi, &self.u) else {
+                break;
+            };
+            self.u -= step;
+            if step.magnitude_squared() < 1e-3 {
+                nih_log!("Converged after {i} iterations (mag. {} < 1e-3)", step.magnitude_squared());
+                break;
+            }
         }
+        // for s in self.u.iter_mut() {
+        //     *s = s.clamp(-1., 1.);
+        // }
+        let y = self.g * self.u + self.s;
+        self.s = self.u;
+        y[3]
+    }
+}
 
-        self.y[3]
+struct Phi {
+    x: f32,
+    g: f32,
+    k: f32,
+    s: Y,
+}
+
+const DIODE_PARAM: f32 = 0.2577819;
+#[inline]
+fn sat(x: f32) -> f32 {
+    x.tanh()
+    // x/(DIODE_PARAM+x.abs())
+}
+
+#[inline]
+fn satd(x: f32) -> f32 {
+    1. - x.tanh().powi(2)
+    // DIODE_PARAM / (DIODE_PARAM + x.abs().powi(2))
+}
+
+impl Phi {
+    #[inline(always)]
+    fn v(&self, s: &Y) -> Y {
+        Y::new(
+            self.x - self.k * s[3] - s[0],
+            s[0] - s[1],
+            s[1] - s[2],
+            s[2] - s[3],
+        )
     }
 
-    fn phi(&self, x: f32, y: Y) -> Y {
-        let vin = Y::new(
-            x - self.k * y[3] - y[0],
-            y[0] - y[1],
-            y[1] - y[2],
-            y[2] - y[3],
-        );
-        let v = vin.map(|x| x.tanh());
-        self.g * v + self.s
+    #[inline(always)]
+    fn eval_u(&self) -> Y {
+        self.v(&self.s).map(sat) * self.g + self.s
+    }
+}
+
+impl ScalarField<f32, 4> for Phi {
+    #[inline(always)]
+    fn eval(&self, u: &SVector<f32, 4>) -> SVector<f32, 4> {
+        self.eval_u() - u
     }
 
-    fn phid(&self, y: Y) -> Y {
-        let vin = Y::new(-1., 1., 0., 0.)
-            + Y::new(0., -1., 1., 0.)
-            + Y::new(0., 0., -1., 1.)
-            + Y::new(-self.k, 0., 0., -1.);
-        (Y::from_element(1.)
-            - vin
-                .map(|x| x.tanh())
-                .component_mul(&y.map(|x| 1. - x.tanh().powi(2))))
-            * self.g
+    #[inline(always)]
+    fn jacobian(&self, _: &SVector<f32, 4>) -> SMatrix<f32, 4, 4> {
+        -SMatrix::identity()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::File, io::Write};
+
+    use crate::lpf::Ladder;
+
+    #[test]
+    fn phi_nr() {
+        const FS: f32 = 44.1e3;
+        const FREQ: f32 = 500.;
+        const FC: f32 = 19.8e3;
+        const PERIOD: f32 = 1. / FREQ;
+        let mut output = File::create("lpf.tsv").unwrap();
+        let mut filter = Ladder::new(FS, FC, 1.);
+        writeln!(output, "\"x\"\t\"y\"\t\"s\"").unwrap();
+        for i in 0..512 {
+            let t = i as f32 / FS;
+            let f = (t / PERIOD).fract();
+
+            let x = 2. * f - 1.;
+            // let x = if f < 0.5 { 1. } else { -1. };
+            let y = filter.process_sample(x);
+            writeln!(output, "{}\t{y}\t\"{:?}\"", x, filter.s).unwrap();
+        }
     }
 }

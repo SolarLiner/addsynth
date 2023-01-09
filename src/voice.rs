@@ -5,7 +5,7 @@ use std::sync::{
 
 use nih_plug::prelude::*;
 
-use crate::lpf::{Ladder, LP1};
+use crate::lpf::Ladder;
 use crate::{
     adsr::{Adsr, AdsrParams},
     oscillator::Oscillator,
@@ -99,8 +99,16 @@ impl Default for VoiceParams {
             .with_string_to_value(formatters::s2v_f32_hz_then_khz())
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(2))
             .with_smoother(SmoothingStyle::Exponential(100.)),
-            q: FloatParam::new("Filter Q", 0., FloatRange::Linear { min: 0., max: 1. })
-                .with_smoother(SmoothingStyle::Linear(30.)),
+            q: FloatParam::new(
+                "Filter Q",
+                0.,
+                FloatRange::Skewed {
+                    min: 0.,
+                    max: 3.,
+                    factor: FloatRange::skew_factor(-2.),
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(30.)),
             fmod: FloatParam::new(
                 "Filter Modulation",
                 3000.,
@@ -136,7 +144,7 @@ pub struct Voice {
     velsqrt: f32,
     params: Arc<VoiceParams>,
     amp: Adsr,
-    filter: Adsr,
+    filter_adsr: Adsr,
     voice_gain: Option<(f32, Smoother<f32>)>,
     lpf: Ladder,
     // lpf: LP1,
@@ -159,7 +167,7 @@ impl Voice {
             velsqrt: velocity.sqrt(),
             params: params.clone(),
             amp: Adsr::new(samplerate, params.amp.clone()),
-            filter: Adsr::new(samplerate, params.filter.clone()),
+            filter_adsr: Adsr::new(samplerate, params.filter.clone()),
             voice_gain: None,
             lpf: Ladder::new(samplerate, params.fhz.value(), params.q.value()),
             // lpf: LP1::new(samplerate, params.fhz.value()),
@@ -204,15 +212,15 @@ impl Voice {
             None => 1.0,
         };
         let amp = self.amp.next() * gain * self.velsqrt;
-        let osc =
-            self.oscillator.sample() * amp * util::db_to_gain(self.params.drive.smoothed.next());
-
+        let drive = util::db_to_gain(self.params.drive.smoothed.next());
         self.lpf.set_fc(
-            self.params.fhz.smoothed.next() + self.filter.next() * self.params.fmod.smoothed.next(),
+            self.params.fhz.smoothed.next()
+                + self.filter_adsr.next() * self.params.fmod.smoothed.next(),
         );
         self.lpf.set_resonance(self.params.q.smoothed.next());
-        // self.lpf.fc = self.params.fhz.smoothed.next() + self.filter.next() * self.params.fmod.smoothed.next();
-        self.lpf.process_sample(osc)
+
+        let osc = self.oscillator.sample();
+        amp * self.lpf.process_sample(osc * drive) / drive
     }
 
     pub fn channel(&self) -> u8 {

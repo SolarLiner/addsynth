@@ -20,6 +20,7 @@ dependencies = [
  "nalgebra",
  "nih_plug",
  "num-complex",
+ "num-traits",
  "rand",
  "rand_pcg",
 ]

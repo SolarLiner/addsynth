@@ -26,6 +26,7 @@ mod tanh;
 mod voice;
 mod lpf;
 mod nr;
+mod math;
 
 /// The number of simultaneous voices for this synth.
 const NUM_VOICES: u32 = 16;

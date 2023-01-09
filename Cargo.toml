@@ -17,6 +17,7 @@ crate-type = ["cdylib"]
 # thread in debug builds.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 num-complex = "0.4.2"
+num-traits = "0.2.15"
 rand = "0.8.5"
 rand_pcg = "0.3.1"
 nalgebra = "0.31.4"
@@ -37,6 +38,9 @@ opt-level = 1
 lto = false
 debug = true
 strip = "none"
+
+[profile.test]
+opt-level = 0
 
 [profile.release]
 opt-level = 3

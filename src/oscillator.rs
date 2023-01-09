@@ -4,7 +4,6 @@ use std::{
 };
 use std::simd::u8x8;
 
-
 use crate::phasor::Phasor8;
 
 const TAU: f32x8 = f32x8::from_array([std::f32::consts::TAU; 8]);
@@ -78,8 +77,9 @@ impl Oscillator {
     }
 
     pub fn sample(&mut self) -> f32 {
-        let phase = self.phasors[0].inc(u8x8::splat(1))[0];
-        phase * 2. - 1.
+        let phasor = &mut self.phasors[0];
+        let phase = phasor.inc(u8x8::splat(1))[0];
+        phase * 2. - 1. - poly_blep(phase, self.phasors[0].step()[0])
     }
 
     #[inline(always)]
@@ -109,4 +109,14 @@ impl Oscillator {
             .unwrap_or_default()
             / total_gain
     }
+}
+
+fn poly_blep(t: f32, dt: f32) -> f32 {
+    if t < dt {
+        let t = t / dt;
+        t + t - t * t - 1.
+    } else if t > 1. - dt {
+        let t = (t - 1.) / dt;
+        t + t + t * t + 1.
+    } else { 0. }
 }
