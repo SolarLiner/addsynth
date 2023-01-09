@@ -95,7 +95,7 @@ impl Ladder {
     }
 
     pub fn set_fc(&mut self, fc: f32) {
-        self.g = PI * fc.min(self.samplerate) / self.samplerate /2.;
+        self.g = PI * fc.min(self.samplerate) / self.samplerate;
     }
 
     pub fn set_resonance(&mut self, q: f32) {
@@ -135,14 +135,14 @@ struct Phi {
 const DIODE_PARAM: f32 = 0.2577819;
 #[inline]
 fn sat(x: f32) -> f32 {
-    // x.tanh()
-    x/(DIODE_PARAM+x.abs())
+    x.tanh()
+    // x/(DIODE_PARAM+x.abs())
 }
 
 #[inline]
 fn satd(x: f32) -> f32 {
-    // 1. - x.tanh().powi(2)
-    DIODE_PARAM / (DIODE_PARAM + x.abs().powi(2))
+    1. - x.tanh().powi(2)
+    // DIODE_PARAM / (DIODE_PARAM + x.abs().powi(2))
 }
 
 impl Phi {

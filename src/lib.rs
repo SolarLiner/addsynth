@@ -11,22 +11,21 @@ use rand_pcg::Pcg32;
 
 use oscillator::Oscillator;
 
+use crate::voice::VoiceParams;
 use crate::{
-    adsr::AdsrParams,
     tanh::TanhLut,
     voice::{Voice, VoiceId},
 };
-use crate::voice::VoiceParams;
 
 mod adsr;
 mod externs;
+mod lpf;
+mod math;
+mod nr;
 mod oscillator;
 mod phasor;
 mod tanh;
 mod voice;
-mod lpf;
-mod nr;
-mod math;
 
 /// The number of simultaneous voices for this synth.
 const NUM_VOICES: u32 = 16;
@@ -107,8 +106,10 @@ enum OscillatorType {
 
 #[derive(Params)]
 struct AddsynthParams {
-    #[nested(id_prefix="voice", group="Voice")]
+    #[nested(id_prefix = "voice", group = "Voice")]
     voice: Arc<VoiceParams>,
+    #[id = "out"]
+    out_drive: FloatParam,
 }
 
 impl Default for Addsynth {
@@ -126,7 +127,19 @@ impl Default for Addsynth {
 impl Default for AddsynthParams {
     fn default() -> Self {
         Self {
-            voice: Arc::new(VoiceParams::default())
+            voice: Arc::new(VoiceParams::default()),
+            out_drive: FloatParam::new(
+                "Output drive",
+                0.,
+                FloatRange::SymmetricalSkewed {
+                    min: -36.,
+                    max: 36.,
+                    center: 0.,
+                    factor: 2.,
+                },
+            )
+            .with_unit("dB")
+            .with_smoother(SmoothingStyle::Exponential(50.)),
         }
     }
 }
@@ -243,6 +256,7 @@ impl Plugin for Addsynth {
             output[0][block_start..block_end].fill(0.0);
             output[1][block_start..block_end].fill(0.0);
 
+
             // These are the smoothed global parameter values. These are used for voices that do not
             // have polyphonic modulation applied to them. With a plugin as simple as this it would
             // be possible to avoid this completely by simply always copying the smoother into the
@@ -256,7 +270,6 @@ impl Plugin for Addsynth {
                     let sample = voice.next_sample();
 
                     output[0][sample_idx] += sample;
-                    output[1][sample_idx] += sample;
                 }
             }
 
@@ -284,6 +297,13 @@ impl Plugin for Addsynth {
             block_end = (block_start + MAX_BLOCK_SIZE).min(num_samples);
         }
 
+        let (l,rest) = output.split_first_mut().unwrap();
+        let (r,_) = rest.split_first_mut().unwrap();
+        for (l, r) in l.iter_mut().zip(r.iter_mut()) {
+            let amp = util::db_to_gain(self.params.out_drive.smoothed.next());
+            *l = sat(amp * *l) / amp.min(1.);
+            *r = *l;
+        }
         ProcessStatus::Normal
     }
 }
@@ -367,3 +387,9 @@ impl Vst3Plugin for Addsynth {
 
 nih_export_clap!(Addsynth);
 nih_export_vst3!(Addsynth);
+
+const DIODE_PARAM: f32 = 0.2577819;
+#[inline]
+fn sat(x: f32) -> f32 {
+    x / (DIODE_PARAM + x.abs())
+}
